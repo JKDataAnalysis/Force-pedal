@@ -1,0 +1,737 @@
+'= JK 06/04/04 =====================================================
+' Processes data from force pedals and outputs results to a new file
+'
+' Version info
+' ------------
+'
+' 1.1:
+' 1.2: 
+' 1.3: 	Array arrithmetic implemented for anglesums and forcesums
+' 1.4:
+' 1.5: 
+' 1.6: 	Debugging
+' 1.7.1: Method for checking slope of angle channels in findcross made more robust
+' 1.7.2: Method for handling zero crossings lagging data modified and flat-spots and zero crossings sorted (use interpolation)
+' 1.7.3: Modulus function in anglesums replaced as mod doesn't work properly with negatives in spike
+'### 1.7.4: Artefacts around zero crossings sorted
+' 1.8.1: Cross-effect coefficients added to calculations
+' ### 1.8.2: Method for calculating cross-effect coefficients changed
+' ### 1.8.3: Modified to allow for opposite negative and positives slopes for cross-effect coefficients 
+' ### 1.8.5: Modified to allow for different negative and positives slopes for cross-effect coefficients 
+' 1.8.6: Channel naming conventions changed so that channel designation is used to name channels rather than source channels. 
+' The previous method created problems if the default channel assignment wasn't used
+'	
+' Still to be done!
+' -----------------
+'
+' Check calculations are correct with different positive and 
+' negative effect slopes
+'
+' Tidy up forcesums to remove replication and redundancy
+' 
+' Error handing required
+' ----------------------
+'
+' Currently seems to handle errors okay, but not really tried to crash it yet!
+'
+' Known bugs
+' ----------
+'
+' If there are more than 1 duplicate channels, checkwavs% missreports
+' the number of duplicates (this is a pretty minor bug though).
+'
+' Need to check whether force channel data are correct with zero and 
+' none zero cross effect coefficients
+'
+'===================================================================
+
+'===================================================================
+' Global consant declarations 
+'===================================================================
+Const arraymax%:= 3000;	' Maximum size of array	to read/write blocks of data in (optimised for shortest run time) 
+Const ver$ := "1.8.6";	' Version of script
+
+'===================================================================
+'Global variable declarations
+'===================================================================
+Var v1% := 0;					' Current view number
+Var er%;							' Used for error codes
+Var i%,j%;						' Looping variables
+Var wavlist%[7];				' Array to hold list of channels for processing in order: crank, L pedal, R pedal, LFx, LFy, Rfx, RFy
+Var fzpre[4];					' Array for pre test zero offsets (LFx, LFy, Rfx, Rfy)
+Var fzslope[4];				' Array for slopes of zero offset (LFx, LFy, Rfx, Rfy)
+Var fcalib[12];				' Array for calibration slopes (DLFx, DLFy, DRfx, DRfy, CLFy, CLFx, CRfy, CRfx (pos then neg))
+Var anglezero[3];				' Array for crank, left pedal and right pedal zero offsets (in that order)
+Var zeros[15000];				' Array for zero crossing times	
+Var rwarray[arraymax%][2];	' Array for reading/writing data to/from, Fx, Fy
+
+'===================================================================
+' Main procedures
+'===================================================================
+
+
+' ----------------------------------------------------------------------
+Proc Choosev(times%[]);	'Choose the time view to be used		(Array of time view handles)
+	Var title$;							' Variable to return view titles to
+	Var timetitle$[20];				' Array for time view titles
+	Var dummy%;							' Variable to return item selected in dialogue to
+
+	For i% := 1 to times%[0] Do	' Fill an array with time view titles
+		View(times%[i%]);
+		title$ := windowtitle$();
+		timetitle$[i%-1]:= title$;		' (timelist%[0]=No of time views)
+	Next
+	timetitle$[times%[0]] := "- New file -";	'Add new file option to list
+	DlgCreate("Time views already open!",0,0,0,0);
+	DlgList(1,"Select time view",timetitle$[],(times%[0]+1));
+	er% := DlgShow(dummy%);	
+	If er% < 1 Then	' user cancelled
+		leaveall();
+	EndIf
+	If dummy% = times%[0] Then	' new file selected
+		getfile();
+	Else
+		v1% := times%[dummy%+1]; 'returns selected view as active view (+1 since 0 is No of views)
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Proc getfile()
+	v1% := FileOpen("",0,1);
+	If v1% <= 0 Then
+	Message ("No file!");
+		leaveall();
+  	EndIf
+End
+
+' ----------------------------------------------------------------------
+Proc leaveall()        'quits program
+	Var lvall%;			' Quit script?
+
+	lvall% := Query("Quit script?|Quit?");
+	If lvall% Then
+		halt
+	Else
+		main();
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Proc checkfile()	' Checks that opened file is appropriate
+	Var waves%[1];	' Dummy array for waveform channels
+	Var numwavs%;	' Number of waveform channels found
+	
+	numwavs% := Chanlist(waves%[],8193);	' fill arary with waveform channel numbers
+	If numwavs% < 7 Then
+		Message ("Incompatible file!|Only %d waveform channel(s) founds\nProgram requires 7",numwavs%);
+		leaveall();
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Func savenew%();	' Creates a new time view to write processed channels to 
+	Var abort%;			' Abort trying to save
+	Var msgstring$;	' String for using in prompt
+	Var filestring$;	' String for default file name
+
+	filestring$:=FileName$(3)+"_p";
+	msgstring$:="Save prcossed data from "+WindowTitle$()+" as...";
+	er% := FileSaveAs(filestring$,0,0,msgstring$);	' Save copy of file. 
+	If er% <0 Then	' File save unsuccesful
+		abort% := Query("Could not save file|Abort save?");
+		If abort% = 1 Then	' Yes selected
+			er% := Query("Delete new channels?");
+			If er% = 1 Then
+				binselect();
+			EndIf
+		leaveall();
+		EndIf	
+	Else
+	EndIf
+	
+	Return (er%)	' Return error code
+End
+
+' ----------------------------------------------------------------------
+Proc getch()		' Procedure to identify channels
+	Var waves%[32];	' Dummy array for waveform channels
+	Var numwavs%;	' Number of waverform channels returned
+
+	numwavs% := Chanlist(waves%[],8193);	
+	For i% := 1 to numwavs% Do				' Get channels with matching names
+		DoCase
+			Case ChanTitle$(waves%[i%]) = "crank" Then wavlist%[0] := waves%[i%];
+			Case ChanTitle$(waves%[i%]) = "L_pedal" Then wavlist%[1] := waves%[i%];	
+			Case ChanTitle$(waves%[i%]) = "R_pedal" Then wavlist%[2] := waves%[i%];
+			Case ChanTitle$(waves%[i%]) = "L_Fx" Then wavlist%[3] := waves%[i%];
+			Case ChanTitle$(waves%[i%]) = "L_Fy" Then wavlist%[4] := waves%[i%];
+			Case ChanTitle$(waves%[i%]) = "R_Fx" Then wavlist%[5] := waves%[i%];
+			Case ChanTitle$(waves%[i%]) = "R_Fy" Then wavlist%[6] := waves%[i%];
+		EndCase
+	Next
+
+	DlgCreate("Please identify channels",0,0);	' Display dailogue to allow user to alter if needed
+	DlgChan(1,"Crank channel",8193);
+	DlgChan(2,"Left pedal channel",8193);
+	DlgChan(3,"Right pedal channel",8193);
+	DlgChan(4,"Left Fx channel",8193);
+	DlgChan(5,"Left Fy channel",8193);
+	DlgChan(6,"Right Fx channel",8193);
+	DlgChan(7,"Right Fy channel",8193);
+	er% := DlgShow(wavlist%[0],wavlist%[1],wavlist%[2],wavlist%[3],wavlist%[4],wavlist%[5],wavlist%[6]);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	
+	For i% := 0 to 6 Do				' Dump channel list to log
+		PrintLog("Channel %d = %s\n",wavlist%[i%],ChanTitle$(wavlist%[i%]));
+	Next
+End
+
+' ----------------------------------------------------------------------
+Func checkch%();	'Check that none of the channels selected are duplicates
+	Var k%;			' Looping variable
+	Var n% := 0;			' Number of duplicates found
+
+	For j% := 0 To 6 Do
+		k% := j% + 1;
+		While k%<6 Do
+			If wavlist%[j%] = wavlist%[k%] Then
+			n% += 1;
+			EndIf
+			k% += 1;
+		Wend
+	Next
+	If n% >0 Then
+		Message("Error!|%d duplicate channels found",n%);
+	EndIf
+	Return(n%);
+End
+		
+' ----------------------------------------------------------------------
+Func getzerodrift%()	' Get the 0 offsets, time of 0 offsets, time of start of data collection, Pedal and crank values at TDC, crank length and Fx, Fy slopes
+	Var fzpost[4];				' Array for post test zero offsets (LFx, LFy, Rfx, Rfy)
+	Var Postt%;					' Time post test zero offeset values taken (relative to first, seconds)
+	Var startt%; 				' Time test started
+	Var maxoffset% := 5000;	' Magnitude of maximum permissable zero offset (normally 200)
+
+	DlgCreate("Enter Fx and Fy zero offsets",0,0);
+	DlgText("Values taken prior to test",1,1);
+	DlgReal(1,"Left Fx offset",maxoffset%*-1,maxoffset%,24,2);
+	DlgText("mV",37,2);
+	DlgReal(2,"Left Fy offset",maxoffset%*-1,maxoffset%,24,3);
+	DlgText("mV",37,3);
+	DlgReal(3,"Right Fx offset",maxoffset%*-1,maxoffset%,24,4);
+	DlgText("mV",37,4);
+	DlgReal(4,"Right Fy offset",maxoffset%*-1,maxoffset%,24,5);
+	DlgText("mV",37,5);
+	DlgText("Values taken after test",1,7);
+	DlgReal(5,"Left Fx offset",maxoffset%*-1,maxoffset%,24,8);
+	DlgText("mV",37,8);
+	DlgReal(6,"Left Fy offset",maxoffset%*-1,maxoffset%,24,9);
+	DlgText("mV",37,9);
+	DlgReal(7,"Right Fx offset",maxoffset%*-1,maxoffset%,24,10);
+	DlgText("mV",37,10);
+	DlgReal(8,"Right Fy offset",maxoffset%*-1,maxoffset%,24,11);
+	DlgText("mV",37,11);
+	DlgInteger(9,"Time post offset taken",1,7200,24,13);
+	DlgText("Secs",37,13);
+	DlgInteger(10,"Time test started",1,7200,24,14);
+	DlgText("Secs",37,14);
+	er% := DlgShow(fzpre[0],fzpre[1],fzpre[2],fzpre[3],fzpost[0],fzpost[1],fzpost[2],fzpost[3],postt%,startt%);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	PrintLog("\nSlopes of pedal drift (mV/min)");
+	PrintLog("\nLFx\t\tLFy\t\tRFx\t\tRFy\n");
+	For j% := 0 To 3 Do
+		Fzslope[j%] := (fzpost[j%]-fzpre[j%])/postt%;
+		PrintLog("%.5f\t\t", fzslope[j%]*60);
+	Next
+	PrintLog("\n");
+	Return(startt%);	' Return time test started
+End
+
+' ----------------------------------------------------------------------
+Proc getpedaloffs()	' Get the pedal and crank offsets and crank length
+	DlgCreate("Enter Crank and pedal offsets",0,0);
+	DlgReal(1,"Crank zero offset",-5,5,36,1);
+	DlgText("volts",49,1);
+	DlgReal(2,"Left pedal zero offset",-5,5,36,2);
+	DlgText("volts",49,2);
+	DlgReal(3,"Right pedal zero offset",-5,5,36,3);
+	DlgText("volts",49,3);
+	er% := DlgShow(anglezero[0], anglezero[1], anglezero[2]);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Proc getforcecalib()	' Get force calibration slopes
+	Var max% := 1000000;				' Maximum acceptable value for slope (5)
+	Var l1%, l2%, l3%;				' Looping variables
+	Var text$, lr$, dc$, xy$;		' strings for text output
+	Var gap%:=0;						' Create gaps between slopes
+
+	'========================== Default calibration slope values ==========================
+	fcalib[0]:= 1.237737672;		' LFx- Direct 
+	fcalib[1]:= 0.403355568;		' LFy	
+	fcalib[2]:= 1.088467403;		' RFx
+	fcalib[3]:= 0.357709229;		' RFy
+ 
+	fcalib[4]:= -0.060134077;		' LFx- Cross +ve
+	fcalib[5]:= 0.00042159;			' LFy	
+	fcalib[6]:= -0.06941123;		' RFx
+	fcalib[7]:= -0.011160975;		' RFy 
+	
+	fcalib[8]:= 0.001892628;		' LFx- Cross -ve
+	fcalib[9]:= -0.012457137;		' LFy	
+	fcalib[10]:= 0.035393491;		' RFx
+	fcalib[11]:= -0.137010883;		' RFy 
+	'=======================================================================================
+
+	DlgCreate("Enter pedal calibration coefficients",0,0,0);
+	For l1%:= 0 to 2 Do	'direct, cross +ve, cross -ve)
+		gap%+=1;
+		DoCase
+			case l1%=0 Then dc$:="direct ";
+			case l1%=1 Then dc$:="cross +ve ";
+			case l1%=2 Then dc$:="cross -ve ";
+		EndCase
+		For l2%:=0 to 1 Do ' left and right
+			If l2%=0 then 
+				lr$:="Left ";
+			Else
+				lr$:="Right ";
+			EndIf
+			For l3%:=0 to 1 Do ' x and y
+				If l3%=0 Then 
+					xy$:="Fx ";
+				Else
+					xy$:="Fy ";
+				EndIf
+				text$:=lr$+xy$+dc$;
+				DlgReal(l1%*4+l2%*2+l3%+1,text$,max%*-1,max%,19,l1%*4+l2%*2+l3%+1+gap%);
+				DlgText("mV/N",32,l1%*4+l2%*2+l3%+1+gap%);
+			Next
+		Next
+	Next
+	er% := DlgShow(fcalib[]);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	PrintLog("\nCalibration coefficients\nChannel\t\tDirect\t\tCross+\t\tCross-\n");
+	For l1%:=0 to 3 Do
+		DoCase 
+			Case l1%=0 Then	text$:="LFx";
+			Case l1%=1 Then	text$:="LFy";
+			Case l1%=2 Then	text$:="RFx";
+			Case l1%=3 Then	text$:="RFy";
+		EndCase
+		PrintLog("%s\t\t%#.6f\t%#.6f\t%#.6f\n",text$,fcalib[l1%],fcalib[l1%+4],fcalib[l1%+8]);
+	Next
+End
+
+' ----------------------------------------------------------------------
+Func findcross%(cmin,cmax)	' Finds zero crossings and write their times to an array (Minimum and maximum value in channel)
+	Const slopesize% := 1000;		' Size of array to read slope check data into
+
+	Var zeroev%;						' Channel for zero crossing events
+	Var slopecheck[slopesize%];	' Small array to check direction of slope 
+	Var er%;								' Used for error handling
+	Var slope;							' slope value;
+	Var slopetype%;					' Whether a -ve (2) or +ve slope (3) used in event extraction
+	Var numcross%;						' Number of zero crossings in channel
+	Var t;								' Time of event crossing
+	Var readt;							' Time block to read
+	Var level;							' Level to detect threshold crossings at
+
+	zeroev% := MemChan (2);	' Create event channel
+	If zeroev% < 1 Then 
+		Message("ERROR!|Unable to create memory channels");
+		leaveall();
+	EndIf
+	ChanTitle$(zeroev%,ChanTitle$(wavlist%[i%])+"_ev");
+	readt := (slopesize%-1)*binsize(wavlist%[i%])/2;
+	er% := ChanData(wavlist%[i%],slopecheck[],MaxTime(wavlist%[i%])/2-readt,readt+MaxTime(wavlist%[i%])+readt); 'Read from middle of file to avoid probs if not pedalling at start/ end
+	If er% <1 Then
+		Message("ERROR!|Data read error!");
+		leaveall();
+	EndIf
+	For j% := 0 to slopesize% -6 Do
+		If ABS((slopecheck[j%+5]-slopecheck[j%])) <0.5 Then ' Don't add zero crossings
+			slope += (slopecheck[j%+5]-slopecheck[j%]);
+		EndIf
+	Next
+	If slope >0 Then ' Positive slope
+		slopetype% := 3; 
+		level := cmax-1 
+	Else
+		slopetype% := 2;
+		level := cmin+1
+	EndIf
+	MemImport(zeroev%,wavlist%[i%],0,MaxTime(wavlist%[i%]),slopetype%,0.4,level);
+	numcross%:= MemGetItem(zeroev%,0); ' Get number of zero crossings in channel
+	For j% := 1 To numcross% Do
+		t := MemGetItem(zeroev%,j%);
+		If t <0 Then
+			Message("ERROR!|Data read error\n\nEvent time read= %g!",t);
+			leaveall();
+		EndIf
+		zeros[j%] := t;	' Fill array with zero crossing times
+	Next
+	er% := ChanDelete(zeroev%,0);		' Finished with event channel so get rid of it (don't ask just do it!) 
+	If er% <0 Then
+		Message("ERROR!|Could not delete event channel %d",zeroev%);
+		leaveall();
+	EndIf
+	Return (numcross%);
+End
+
+' ----------------------------------------------------------------------
+Func getmin(ch%)	' Gets minimum values in angle channels (channel to get value from)
+	Var min1 := -5,min2;	' Mimimum values found 
+	Var stt := 0;			'Start time for finding minimum
+	Var endt;				'End time for finding minimum
+	
+	For j% := 0 To 2 Do
+		endt:= Maxtime(ch%)*(j%+1)/3;
+		min2 := (ChanMeasure(ch%,9,stt,endt));
+		If min2 > min1 Then min1 := min2; EndIf	' Use highest to avoid didgy dodgy data
+		stt:=endt;
+	Next
+	Return (min1)
+End
+
+' ----------------------------------------------------------------------
+Func getmax(ch%)	' Gets maximum values in angle channels (channel to get value from)
+	Return(ChanMeasure(ch%,8,0,Maxtime(ch%)));
+End
+
+' ----------------------------------------------------------------------
+Func readwav (ch%,t,el%,xy%)	' Read wave data into an array (Channel to read, time to read from, number of elements to read, index to read into (0,1))
+	Var readsize%;		' Number of data points read in
+	Var readt;			' Time of last data point read in
+	Var maxreadtime;			' The maximum amount of time that can be read into array
+
+	readt:= (el%)*binsize(ch%);		' Calculate time window that will fit it the array 
+	If readt+t > MaxTime(ch%) Then	' Would read from beyond end of file
+		readt := MaxTime(ch%)-t;
+	EndIf
+	readsize% := ChanData(ch%,rwarray[][xy%],t,t+readt);	' Read in array full
+	If readsize% <1 Then		
+		Message("ERROR!|Data read error!");	
+		leaveall();	
+	EndIf		
+	Return (t+readt);
+End
+
+' ----------------------------------------------------------------------
+Proc writewav(memch%,t,x%,rw%);	' Write array data to wav channel (Channel to write to, time to start write from, number of elements to write, index of rwarray to write)
+	MemSetItem(memch%,0,t,rwarray[0:x%][rw%]);	' Write data to memory channel
+End
+
+' ----------------------------------------------------------------------
+Func dupwav%(wChan%) 'Copy waveform to a memory channel
+	var mc%;
+
+	If ChanKind(wChan%)<>1 then return 0 endif; 'Not a waveform!
+	mc% := MemChan(1,0,BinSize(wChan%));     'Create waveform channel
+	If mc% < 1 Then 
+		Message("ERROR!|Unable to duplicate channels");
+		leaveall();
+	EndIf
+   ChanScale(mc%, ChanScale(wChan%));				'Copy scale 
+   ChanOffset(mc%, ChanOffset(wChan%));  			'...and offset...
+   ChanUnits$(mc%, ChanUnits$(wChan%));  			'...and units
+   ChanTitle$(mc%, ChanTitle$(wavlist%[i%]));	'... and title
+   MemImport(mc%, wChan%, 0, MaxTime()); 			'Copy data
+	ChanShow(mc%);	' Show new channel (has to be shown to be able to select it!)
+	ChanSelect(mc%,1);	                        'Flag new channel for deletion
+	Return mc%;   'Return the new channel number
+End;
+
+' ----------------------------------------------------------------------
+Func createwav%(ymin,ymax,unit$)	' Create wav channel (min and max Y range)
+	Var chanmem%;	' Handle of channel created
+
+	chanmem% := MemChan(1,0,BinSize(wavlist%[i%]));	' Create waveform channel to write to
+	If chanmem% < 1 Then 
+		Message("ERROR!|Unable to create memory channels");
+		leaveall();
+	EndIf
+	ChanUnits$(chanmem%,unit$);
+	ChanScale(chanmem%,1000);
+	FrontView(v1%);
+	YRange(chanmem%,ymin,ymax);
+	ChanShow(chanmem%);
+	ChanSelect(chanmem%,1);	' Set channel as selected (used for export)
+	Return(chanmem%);		' Handle of channel created
+End
+
+' ----------------------------------------------------------------------
+Proc fixzeros(ch%,ncross%);		' Correct dodgy data at zero crossings (Channel to process, number of zero crossings in channel)
+	Const win% := 40;	' Size of array to read in
+	Var zeroel%;		' Element of array containing zero crossing 
+	Var k%;				' Counting variable
+	Var t;				' Time to start read from
+	Var slope1;			' Slope of line before zero crossing
+	Var slope2;			' Slope of line after zero crossing
+
+	For j% := 0 to ncross%-1 Do
+		t:= zeros[j%]-(win%/2)*BinSize(wavlist%[i%]);
+		If t<0 Then ' If have zero crossing right at start of file
+			t:= 0;
+		EndIf
+		readwav (wavlist%[i%],t,win%,0);		' Call wav read function (channel to read from, time to read from, read size, rwarray index)
+		slope1 := 0;
+		slope2 := 0;
+		For k%:=0 to 5 Do ' Only use first and last six points
+			slope1+=rwarray[k%+1][0]-rwarray[k%][0];
+		Next
+		slope1 /= 6;
+		For k%:=win%-7 to win%-2 Do
+			slope2+= (rwarray[k%+1][0]-rwarray[k%][0]);
+		Next
+		slope2 /= 6;
+		slope1 +=slope2;
+		slope1/=2;
+		For k% := 6 to win%/2 Do	' Fill array with interpolated data	
+		'### NOTE this is susceptible to distortion by bad data since extrapolates from a single point. However, in practice it seems to 
+		' be okay since the data is pretty clean
+			rwarray[k%][0] := rwarray[k%-1][0]+slope1;
+		Next
+		For k% := win%-8 to win%/2+1 Step -1 Do
+			rwarray[k%][0] := rwarray[k%+1][0]-slope1;
+		Next
+		For k%:=0 to win%-1 Do
+			If rwarray[k%][0] <-0.5 AND k% >0 Then	' Take out bad data (k%>0 just so wouldn't crash if bad data in first array element)
+				rwarray[k%][0]:=rwarray[k%-1][0];
+			EndIf
+	  Next
+		writewav(wavlist%[i%],t,win%-1,0);	
+	Next
+End
+' ----------------------------------------------------------------------
+'Func modulus(val,div);	' Calculate modulus of array (value, divisor) [mod function doesn't work properly with negatives]
+'	val:=	val-div*round(val/div-0.49999999);	
+'	Return(val);
+'End
+
+' ----------------------------------------------------------------------
+Proc anglesums(cmin, cmax)	' Convert voltages to degrees allowing for offsets (min and max values in channel)
+	Var modsum[arraymax%];	' Temporary array for doing modulus calc
+
+	ArrSub(rwarray[][0],anglezero[i%]);
+	ArrMul(rwarray[][0],(360/(cmax-cmin)));
+	If i% = 1 then	' Left pedal
+		ArrAdd(rwarray[][0],180); 'offset left pedal by 180 degrees
+	Else
+		ArrSubR(rwarray[][0],360);	' Reverse slopes 
+	EndIf
+	ArrConst(modsum[],rwarray[][0]);	' Copy rwarray to temp array	}
+	ArrDiv(modsum[],360);				' n-d									}
+	ArrSub(modsum[],0.49999999); 		' int (n-d)							} just does MOD
+	Round(modsum[]);						'  "    "							}
+	ArrMul(modsum[],360);				' 360 * int (n-d)					}
+	ArrSub(rwarray[][0],modsum[]);	' n - 360 * int (n-d)			}
+End
+
+
+' ----------------------------------------------------------------------
+Proc forcesums(ch%,time[])	' Convert force channels to actual forces 	(Channel to process, time array)
+	Var sumsarr[arraymax%];		' Array to use in sums
+	Var temparr[arraymax%][4];	' Array for holding channel data
+	Var k%; 							' looping variable	
+
+	' Remove drift and offsets from channels
+	For j% := 0 to 1 Do		' Do for Fx and Fy
+		ArrConst(sumsarr[],time[]);								' Copy time array onto array to use in sums
+		ArrMul(sumsarr[],fzslope[i%-3+j%]);						' Multiply by the drift slope
+		ArrSub(rwarray[][j%],fzpre[i%-3+j%]);					' Subtract the pre-test zero offset
+		ArrSub(rwarray[][j%],sumsarr[]);							' Subtract the drift slope
+		' Fill temporary arrays and divide by calibration coefficients
+		For k% := 0 to 1 Do	' Do for Main and cross effects
+			ArrConst(temparr[][j%*2+k%],rwarray[][j%]);				' Copy channel data to temp arrays
+		Next
+	Next
+	' Remove cross effects and divide by calibration slope
+	' NB. Cross effects x,y designation refers to the channel in which the effect appears NOT the one in which the loading occurs.
+	For j% := 0 to 1 Do		' Do for Fx and Fy
+		For k%:= 0 to arraymax%-1 Do
+			If temparr[k%][2*j%+1]>0 Then	' If positive
+				temparr[k%][2*j%+1]*=fcalib[i%+2-j%];
+			Else
+				temparr[k%][2*j%+1]*=fcalib[i%+2-j%+4];
+			EndIf
+		Next
+		ArrAdd(temparr[][j%*2],temparr[][j%*2+1]); 		' Remove cross effects
+		If fcalib[i%-3+j%] <>0 Then							' Avoid problems if entered as zero
+			ArrDiv(temparr[][j%*2],fcalib[i%-3+j%]);		' Divide by load calibration slope
+		EndIf
+	Next
+
+	' Add to elements back to rwarray
+	' ########## This can probably be made redundant if only two temporary arrays are used for the cross effects ######
+	For j% := 0 to 1 Do		' Do for Fx and Fy
+		ArrConst(rwarray[][j%],temparr[][j%*2]);		' Copy in main effects to array
+	Next
+End
+
+' ----------------------------------------------------------------------
+Func freech%()	' Find spare channel
+	Var k%;	' Counting variable
+	k% := 1;
+	While ChanKind(k%) <> 0 And k% <= 32 Do	' Look for free channel
+		k% += 1;
+	Wend
+	If k% > 32 Then' No free channels
+		Message("ERROR!|No free Channels\nCannot save!");
+		leaveall();
+	EndIf
+	Return(k%);
+End
+
+' ----------------------------------------------------------------------
+Proc binselect();		' Bin selected channels
+	ChanDelete(-3,0);	' Delete selected channels
+End
+
+' ----------------------------------------------------------------------
+Proc toolbarmsg();	' Put progress info on toolbar
+	Var toolbar$;					' String for messages for toolbar
+
+	toolbar$ := "Processing " + ChanTitle$(wavlist%[i%]) + " channel";
+	ToolbarText(toolbar$);
+End
+
+' ----------------------------------------------------------------------
+Proc cleanchan(tmpch%);	' Tidy up created channels
+	Var f%;	' Handle of free channel
+
+	f% := freech%();
+	er% := MemSave(tmpch%,f%,0);
+	If er% <0 Then
+		Message("Error!|Could not save memory channel");
+		leaveall();
+	EndIf
+	ChanDelete(tmpch%); 
+	ChanShow(f%);
+	Optimise(f%);
+	ChanSelect(f%,1);		' Flag created channels for deletion
+	ExportChanList(0,MaxTime(wavlist%[i%]),f%);	' Flag channel for export
+End
+
+'===================================================================
+' Main routine
+'===================================================================
+
+Proc main()
+	Var offset; 					' Zero offset value
+	Var currentch%;	 			' Channel number currently processing
+	Var tempch%[2];				' Temporary memory channels created (Fx, Fy)
+	Var lastt;						' Last time read in
+	Var t;							' Time to read from
+	Var chmin,chmax;				' Minimum and maximum values in channel
+	Var timelist%[20];			' Array for list of time views (assumes no more than 20)
+	Var titlech$[7];				' Title of created channel
+	Var teststt%;					' Time test started relative to first calibration
+	Var times[arraymax%];		' Array of time to multiply by in force sums
+	Var arrindex%[arraymax%];	' Array to fill with index of array (used in forcesums)
+	Var numcross%;					' Number of zero crossings found in channel
+
+	titlech$[0]:="CA_p";		' Set channel names
+	titlech$[1]:="LPA_p";
+	titlech$[2]:="RPA_p";
+	titlech$[3]:="LFx_p";
+	titlech$[4]:="LFy_p";
+	titlech$[5]:="RFx_p";
+	titlech$[6]:="RFy_p";
+
+	ToolbarText("Running script version " + ver$);
+	Viewlist (timelist%[], 1);	' Are there any time views already open
+	If timelist%[0] > 0 Then  'There are some time views
+		choosev(timelist%[]);
+	Else
+		getfile();		' No time views open go and get one
+	EndIf
+	View(v1%);	' Set returned view as active 
+	checkfile();
+	ChanSelect(-1,0);	' Deselect all channels or will delete anything that is selected at program start
+	PrintLog("\n\n=====>> FP_process v%s <<=================================>>> %s <<<====================================\n\n",ver$,Windowtitle$());
+	Repeat 
+		getch();
+		er% := checkch%();
+	until er% = 0;
+	teststt% := getzerodrift%();
+	getpedaloffs();
+	getforcecalib();
+	ExportChanList();	' Clear channel export list
+	For j% := 0 to arraymax%-1 Do	' Fill array with index of array (used in forcesums)
+		arrindex%[j%] := j%;
+	Next
+	For i% := 0 to 2 Do	' Do angle channels ============================================================================
+		toolbarmsg();
+		tempch%[0] := dupwav%(wavlist%[i%]);
+		wavlist%[i%] := tempch%[0];	' Shift flag to duplicate channel
+		chmin := getmin(wavlist%[i%]);
+		chmax := getmax(wavlist%[i%]);
+		numcross% := findcross%(chmin,chmax); ' Find zero crossings
+		If i%>0 Then ' Don't bother with crank channel
+			fixzeros(wavlist%[i%],numcross%);		' Check 0 crossing data and correct	(Channel to process, number of zero crossings)
+		EndIf
+				'(channel to search, start and end time of array, min and max values in channel)
+				' ### In theory this shouldn't be neccesary for the crank channel but without it you do get occasional spikes around
+				' the zero crossing so leave it in there.
+		chmin := getmin(wavlist%[i%]);	' Redo as will have changed
+		chmax := getmax(wavlist%[i%]);	' 	"			"			"
+		tempch%[0] := createwav%(0,360,"deg");	' Create waveform channel to write processed angle data to (min, max y scaling, new units)
+'		titlech$ := Left$(ChanTitle$(wavlist%[i%]),7)+"_p"; ' Take first 7 characters of existing name (max len = 9) and add _p
+'		ChanTitle$(tempch%[0],titlech$);
+		ChanTitle$(tempch%[0],titlech$[i%]);
+		t := 0;	' Start at time = 0;
+		Repeat ;
+			lastt := readwav (wavlist%[i%],t,arraymax%-1,0);		' Call wav read function (channel to read from, time to read from, read size (full array less one or leaves gaps), rwarray index)
+			anglesums(chmin,chmax);		' Do calculations to change voltages to degrees etc	(min and max values in channel)
+			writewav(tempch%[0],t,arraymax%-1,0);	' Call wav write function (channel to write to, time to write from, write size (full array), index of rwarry to write)
+			t := lastt;
+		Until lastt >= MaxTime(wavlist%[i%]); ' Reached end of file
+		cleanchan(tempch%[0]);
+	Next
+	For i% := 3 to 5 Step 2 Do ' Do Force channels ============================================================================
+		For j% := 0 to 1 Do
+			tempch%[j%] := createwav%(-300,1000,"N");	' Create waveform channel to write processed force data to (min, max y scaling, New units)
+'			titlech$ := Left$(ChanTitle$(wavlist%[i%+j%]),7)+"_p"; ' Take first 7 characters of existing name (max len = 9) and add _p
+'			ChanTitle$(tempch%[j%],titlech$);
+			ChanTitle$(tempch%[j%],titlech$[i%+j%]);
+		Next
+		ArrConst(times[],arrindex%[]);	' Set to be equal to arrindex
+		ArrMul(times[],BinSize(wavlist%[0])); ' Times by binsize to convert to time ### Assumes all binsizes are the same
+		ArrAdd(times[],teststt%);	' Add time of test start
+		t := 0;	' Start at time = 0;
+		Repeat ;
+			lastt := readwav (wavlist%[i%],t,arraymax%-1,0);	' Read Fx channel data (channel to read from, time to read from, read size (full array less one or leaves gaps), Fx)
+			readwav (wavlist%[i%+1],t,arraymax%-1,1);		' Read Fy channel data (channel to read from, time to read from, read size (full array less one or leaves gaps), Fy)
+			' ### This assumes start and end times are the same for the Fx and Fy Channels
+			forcesums(wavlist%[i%],times[]);		' Do calculations to change voltages to Newtons	(Channel to process, time array)
+			For j% := 0 to 1 Do 
+				writewav(tempch%[j%],t, arraymax%-1,j%);	' Call wav write function (channel to write to, time to write from, write size (full array), index of rwarray to write)
+			Next
+			ArrAdd(times[],lastt-t);				' add t to index array
+			t := lastt;
+		Until lastt >= MaxTime(wavlist%[i%]); ' Reached end of file
+		For j% := 0 to 1 Do 
+			cleanchan(tempch%[j%]);
+		Next
+	Next	' ==============================================================================================
+	er% := 1;
+	Repeat
+		er% := savenew%();		' Export Memory channels to new file (returns error code)
+	Until  er%=0; ' Keep trying until file save succesful (can escape from file save function)
+	binselect();	' Ditch selected channels
+	leaveall();
+	main();
+End
+
+main();	' Gets the thing going!!!

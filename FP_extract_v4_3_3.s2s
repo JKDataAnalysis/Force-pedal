@@ -1,0 +1,1042 @@
+'============================================================================
+' Extracts time window means and SDs of sum, mean or peaks within segments of 
+' crank cycle, crank position and sum values between thresholds crossings or 
+' crank position and amplitude of peaks.
+'
+' Version info
+' ------------
+'
+' 1.0: Get the thing started
+' 1.1: Processes all channels succesfully but just exports data to log window
+' 			and doesn't do time windowing
+' 1.2: Export to text file implemented
+' 1.3: Time windowing implemented
+' 1.4: Debugging
+' 1.5: Error handling tightened up (window size is > file length, no crank channel selected)
+' 2.0: Error handling introduced to handle noisy data in crank channel that leads to erroneous event markers
+' 3.0: Modified to allow selection of channels for analysis, variable start and end times
+' 4.0: Modified to do processing by thresholds and peaks in source channels
+' 4.1: Routine added to find max values
+' 4.2: Routines added to allow threshold crossing to be found where peaks occur around crank zero crossing
+' 4.3: Debugging plus circular stats added to calculate mean angles (see Batschelet, 1981 and Fisher, 1993)
+' 4.3.1: Degugging plus making log window front view so user can keep track of what doing
+' 4.3.2: Finding of thresholds for on/off positions modified to allow for double peaks 
+' 4.3.2: getch modified to allow selection of different groups of channel (FP: peak, mean and threshold)
+'
+' Still to be done!
+' -----------------
+'
+' * Should really add a routine to getthreshpos to remove outliers in array which could occur if
+' there are spikes in the crank data.
+'
+' Checks to be made
+' ----------------------
+'
+' Check whether maths is correct for SD for angles. Error handling in place to handle sum x and y = 1
+' but not big on this!
+' 
+' Check the number of segments being passed to write data is correct, returns a few with 0 or 1: problem
+' with double peaks?
+'
+' Error handing required
+' ----------------------
+' 
+' Known bugs
+' ----------
+'
+'===================================================================
+
+'===================================================================
+' Global consant declarations 
+'===================================================================
+Const arraymax%:= 1000;		' Maximum size of array	to read/write blocks of data in	
+Const timesize%:= 8000;		' Maximum number of level crossing times that it can handle
+Const ver$ := "4.3.3";		' Version of script 
+Const twmax%:= 1000;			' Maximum number of time windows can handle
+Const maxthresh% := 15000;	' Maximum number of threshold crossings	
+
+'===================================================================
+'Global variable declarations
+'===================================================================
+Var v1% := 0;							' Current view number
+Var er%;									' Used for error codes
+Var i%,j%;								' Looping variables
+Var wavlist%[32];						' Array to hold list of channels for processing (crank angle in 0)
+Var readarray[arraymax%];			' Array for reading data into
+var segments%;							' Size of crank segments to divide crank cycle into
+var timew%;								' Size of time windows
+Var firstt;								' Time of first threshold crossing
+Var winedge%[1500][2];				' Array to fill with indexes of threshold crossings as edge of time windows and angles at which they occur
+Var thresht[36][maxthresh%];		' Array to hold threshold crossing times (threshold)(time (up tp approx 35 mins at 120 rpm, 10 degree segments))
+Var startt,endt;						' Start and end times for analysis
+Var thresh,int%;						' Threshold analysis parameters (threshold value, include sums between thresholds)
+Var chthresh[32];						' Array for thrshold values found in channels
+Var peakt2;								' Time of 2nd peak (used in threshold crossings)
+
+'===================================================================
+' Main procedures
+'===================================================================
+
+
+' ----------------------------------------------------------------------
+Proc Choosev(times%[]);	'Choose the time view to be used		(Array of time view handles)
+	Var title$;							' Variable to return view titles to
+	Var timetitle$[20];				' Array for time view titles
+	Var dummy%;							' Variable to return item selected in dialogue to
+
+	For i% := 1 to times%[0] Do	' Fill an array with time view titles
+		View(times%[i%]);
+		title$ := windowtitle$();
+		timetitle$[i%-1]:= title$;		' (timelist%[0]=No of time views)
+	Next
+	timetitle$[times%[0]] := "- New file -";	'Add new file option to list
+	DlgCreate("Time views already open!",0,0);
+	DlgText("Select time view",0,1);
+	DlgList(1,35,timetitle$[],(times%[0]+1),15,1);
+	er% := DlgShow(dummy%);	
+	If er% < 1 Then	' user cancelled
+		leaveall();
+	EndIf
+	If dummy% = times%[0] Then	' new file selected
+		getfile();
+	Else
+		v1% := times%[dummy%+1]; 'returns selected view as active view (+1 since 0 is No of views)
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Proc getfile()
+	v1% := FileOpen("",0,1);
+	If v1% <= 0 Then
+		Message ("No file!");
+		leaveall();
+  	EndIf
+End
+
+' ----------------------------------------------------------------------
+Proc leaveall()   'quits program	
+	Var lvall%;			' Quit script?
+
+	lvall% := Query("Quit script?|Quit?");
+	If lvall% Then
+		halt
+	Else
+		main();
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Func getch%(crank%)		' Procedure to identify channels (handle of crank angle channel)
+	Const maxch%:=32;			' Maximum number of channels to allow
+
+	Var waves%[maxch%];		' Dummy array for waveform channels		
+	Var chsel%[maxch%];		' Flags for selected channels
+	Var chtype%;				' Type of channels to look for (FP/EMG)
+	Var fp%;						' Flagged as a force pedal channel
+	Var x%,y%;					' x and y positions of check boxes
+
+	er%:=	Chanlist(waves%[],8193); 
+	If er%<1 Then
+		Message("Error!|View is not a time view");
+		leaveall();
+	EndIf
+	For i% := 1 to waves%[0] Do	' Remove crank channel form the list
+		If waves%[i%] = crank% Then	' is crank channel
+			ArrConst(waves%[i%:(waves%[0]-i%+1)],waves%[i%+1:waves%[0]-i%+1]);
+			waves%[0]-=1;
+		EndIf
+	Next
+	DlgCreate("Channel type to look for?",0,0,35);	' Just speeds up tick box checking
+	DlgList(1,25,"1: FP- Force|2: FP- Power/ IE/ CV|3: FP: Work|4: EMG|5: Other",5,2,1);
+	er% := DlgShow(chtype%);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	If chtype% <5 Then	' Set default channel flagging
+		For i% := 1 to waves%[0] Do	
+			DoCase
+				Case chtype% = 0 Then	' Force pedal peak channels
+					If lcase$(Mid$(ChanTitle$(waves%[i%]),3)) = "feff"  
+						Or lcase$(Mid$(ChanTitle$(waves%[i%]),3)) = "fineff" 
+						Or lcase$(Mid$(ChanTitle$(waves%[i%]),3)) = "fr" 
+					Then
+						chsel%[i%]:= 1;						
+					EndIf
+				Case chtype% = 1 Then	' Force pedal mean channels
+					If lcase$(ChanTitle$(waves%[i%])) = "cv" 
+						Or lcase$(Mid$(ChanTitle$(waves%[i%]),3)) = "iie" 
+						Or lcase$(Mid$(ChanTitle$(waves%[i%]),3)) = "power" 
+					Then
+						chsel%[i%]:= 1;						
+					EndIf
+			Case chtype% = 2 Then	' Force pedal threshold channels
+				If lcase$(Mid$(ChanTitle$(waves%[i%]),3)) = "work" 
+				Then
+					chsel%[i%]:= 1;
+				EndIf
+			Case chtype% = 3 Then	' EMG channels
+					If lcase$(Right$(ChanTitle$(waves%[i%]),2)) = "ga"  
+						Or lcase$(Right$(ChanTitle$(waves%[i%]),2)) = "vm"  
+						Or lcase$(Right$(ChanTitle$(waves%[i%]),2)) = "rf"  
+						Or (lcase$(ChanTitle$(waves%[i%]))) = "rta" ' Right only as left has cross-talk in is filtered channel selected below
+						Or lcase$(Right$(ChanTitle$(waves%[i%]),2)) = "st"  
+						Or lcase$(Right$(ChanTitle$(waves%[i%]),2)) = "bf"  
+						Or lcase$(ChanTitle$(waves%[i%])) = "filtered"  
+					Then
+						chsel%[i%]:= 1;						
+					EndIf
+
+			Else
+				chsel%[i%]:= 0;
+			EndCase
+		Next
+	EndIf
+	DlgCreate("Please select channels for analysis",0,0);	
+	x%:=1; y%:=1;
+	For i% :=1 to waves%[0] Do
+		If y%>5 then x%+=20;	y%:=1; EndIf
+		DlgCheck(i%,ChanTitle$(waves%[i%])+" ("+Str$(waves%[i%])+")",x%,y%);
+		y%+=1;
+	Next
+	er% := DlgShow(chsel%[1:waves%[0]]);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	j%:=1;
+	PrintLog("Channels selected for processing as follows;\n\n");
+	For i% :=1 to waves%[0] Do												
+		If chsel%[i%]= 1 Then 
+			wavlist%[j%] := waves%[i%];
+			PrintLog("%d\t%s\n",wavlist%[j%],ChanTitle$(wavlist%[j%]));	
+			j%+=1;
+		EndIf
+	Next
+	Return(j%);	' Return number of selected channels
+End
+
+
+' ----------------------------------------------------------------------
+Func getca%()		' Procedure to identify crank channel
+	Var waves%[32];		' Dummy array for waveform channels		THIS DUPLICATES CODE IN CHECKFILE!
+	Var numwavs%;			' Number of waverform channels returned
+	Var ca%:=0;					' Handle of crank channel
+
+	numwavs% := Chanlist(waves%[],8193);	
+	For i% := 1 to numwavs% Do				' Get channel with matching name
+		If ChanTitle$(waves%[i%]) = "CA_p" Then 
+			ca% := waves%[i%];
+		EndIf
+	Next
+	Repeat
+		DlgCreate("Please identify crank channel",0,0);	' Display dialogue to allow user to alter if needed
+		DlgChan(1,"Crank channel",8193);
+		er% := DlgShow(ca%);
+		If er% = 0 Then 
+			leaveall();
+		EndIf
+		If ca% <1 Then
+			Message("Error!|No channel selected!");
+		EndIf
+	Until ca% > 0; ' Crank channel found
+	PrintLog("Crank channel: %d\t%s\n",ca%,ChanTitle$(ca%));
+	Return (ca%);
+End
+
+' ----------------------------------------------------------------------
+Func gettype%(); 	' Choose type of analysis to be conducted (0: by segments of crank cycle, 1: thresholds by whole of crank cycle)
+	var t%;	' Type of analysis selected
+
+	DlgCreate("Analysis Type",0,0);
+	DlgText("Type of analysis",0,1);
+	DlgList(1,35,"1: Analysis by crank segments|2: Threshold analysis of whole cycle|3: Peak analysis",3,16,1);
+	er% := DlgShow(t%);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	Return (t%)
+End
+
+' ----------------------------------------------------------------------
+Func getpeakcoeff(peakcoeff); 	' Get % of peak value must fall below to be detected as a peak (default value)
+
+	DlgCreate("% of peak",0,0);
+	DlgText("% of peak to detect threshold at",0,1);
+	DlgInteger(1,4,1,100,32,1);
+	er% := DlgShow(peakcoeff);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	Return (peakcoeff)
+End
+
+' ----------------------------------------------------------------------
+Proc gettimes(dtw%,dstt,dent); 	' Get parameters of analysis to carry out (default values)
+	Var mintw;			' Minimum size of time window available in file
+
+	timew%:=dtw%; startt := dstt; endt := dent;
+	Repeat
+		DlgCreate("Time parameters",0,0);
+		DlgInteger(1,"Size of time windows (s) (5-360)",5,360,0,1); 
+		DlgReal(2,"Start time (s)",0,MaxTime(),0,3); 
+		DlgReal(3,"End time (s)",0,MaxTime(),0,4);
+		DlgText("Enter 0 to set end time to max time",3,5);
+		er% := DlgShow(timew%,startt,endt);
+		If er% = 0 Then 
+			leaveall();
+		EndIf
+		If endt = 0 Then 
+			endt := MaxTime(); 
+		EndIf
+		If MaxTime()/timew% > twmax% Then
+			mintw := 1-((Maxtime()/twmax%)-Round((Maxtime()/twmax%)));	' Round up to nearest second
+			mintw+=(Maxtime()/twmax%);
+			Message("Invalid data entred!|File is too long to process with that time window\n\nMinimum time window available is %d seconds",mintw);
+			er% := 0;
+		EndIf
+		If startt>endt Then
+			Message("Error!|End time must be greater than start time!");
+			er% :=0;
+		EndIf
+		If er% <>0 And startt+timew%>endt Then
+			er% := Query("Warning!|Less than one time window between selected times!\n\nContinue anyway?");
+		EndIf
+	Until er%<> 0;
+End
+
+' ----------------------------------------------------------------------
+Func getsegs%(segs%); 	' Get size of crank angle segments (Default value)
+	Repeat
+		DlgCreate("Angle segments",0,0);
+		DlgInteger(1,"Size of segments (deg) (10-360)",10,360,0,1);
+		er% := DlgShow(segs%);
+		If er% = 0 Then 
+			leaveall();
+		EndIf
+		If 360 mod segs% > 0 Then
+			Message("Invalid data entered!|Size of increments must be a factor of 360\ne.g.1,5,10,15,30"); 	
+			er% :=0;
+		EndIf
+	Until er%<> 0;
+	Return(segs%);
+End
+
+' ----------------------------------------------------------------------
+Func checkch%(numch%);	'Check that none of the channels selected are duplicates (number of waveform channels found)
+	Var k%;				' Looping variable
+	Var n% := 0;		' Number of duplicates found
+	Var chmin := 0;	' Length of shortest channels
+
+	For j% := 0 To numch%-2 Do
+		k% := j% + 1;
+		While k%<numch%-1 Do
+			If wavlist%[j%] = wavlist%[k%] Then
+			n% += 1;
+			EndIf
+			k% += 1;
+		Wend
+		If chmin < MaxTime(wavlist%[j%]) Then
+			chmin := MaxTime(wavlist%[j%]) 
+		EndIf
+	Next
+	If chmin < timew% Then	' Is timewindow greater than length of shortest channel?
+		Message("Error!|Time window exceeds length of some channels");
+		Leaveall();
+	EndIf
+	If n% >0 Then
+		Message("Error!|%d duplicate channels found",n%);
+	EndIf
+	Return(n%);
+End
+		
+' ----------------------------------------------------------------------
+Func setevent(cross,stt,ent,chan%,mode%,cz%,ind%,fill%)	' Finds threshold crossing points and fills array with times
+	' (level wave must cross,start and end times, channel to find events in, event mode, looking for crank zero, index of array
+	' to assign data to, flag for if doing filling)
+	Var er%;						' Used for error handling
+	Var t;						' Time of event crossing
+	Var readt;					' Time block to read
+	Var k%;						' Looping variable
+	Var itemn%;					' Number of items added to channel
+	Var tempch%;				' Temporary event channel for segments threshold crossings
+	Var mingap;					' Minimum time gap between thresholds
+	Var r;						' Value to return, either number of events if filling or time of event if not
+
+	tempch% := MemChan (2);	' Create event channel
+	If tempch% < 1 Then 
+		Message("ERROR!|Unable to create memory channels");
+		leaveall();
+	EndIf	
+	If cz% = 1 Then	' Looking for crank zero crossings
+		cross := 180;
+		mingap := 0.4 ;	' 150 rpm
+	Else
+		mingap := 0.4*(ind%*segments%/360);	' Not 0.4 since noise at zero crossing will lead it to miss subsequent thresholds
+	EndIf
+	itemn% := MemImport(tempch%,chan%,stt,ent,mode%,mingap,cross);
+	If itemn% <0 Or itemn% > maxthresh% Then
+			Message("ERROR!|All gone Pete Tong with finding events\n\nFound %d events between %.3f and %.3f s in channel %d",itemn%,stt,ent,chan%);
+		leaveall();
+	EndIf
+	If fill% = 1 Then
+		For k% := 1 to itemn% do	' Fill array with event times
+			thresht[ind%][k%-1] := MemGetItem(tempch%,k%);
+			If thresht[ind%][k%-1] <0 Then
+				Message("ERROR!|Event data read error\n\nEvent time read= %g!",t);
+				leaveall();
+			EndIf
+		Next
+		r := itemn%;
+	Else
+		DoCase
+			Case itemn% = 1 Then 
+				r :=MemGetItem(tempch%,1);
+				peakt2 := r;
+			Case itemn% = 2 Then 	' >>>> Reverse these???
+				r := MemGetItem(tempch%,2);
+				peakt2 := MemGetItem(tempch%,1);
+			Else 
+				r := itemn% * -1;
+		EndCase
+	EndIf
+	er% := ChanDelete(tempch%,0);		' Finished with event channel so get rid of it (don't ask just do it!)	
+	If er% <0 Then
+		Message("ERROR!|Could not delete event channel %d",tempch%);
+		leaveall();
+	EndIf
+	Return(r);	
+End
+
+' ----------------------------------------------------------------------
+Func readwav% (chan%,tst,tend)	' Readwave data into an array (Channel to read, time to start and end read from)
+	Var readsize%;		' Number of data points read in
+	Var readt;			' Time of last data point read in
+	Var temp;			' Temp buffer variable for sorting times
+
+	If tst > tend Then ' start time is before end time- swap times
+		temp:=tst;
+		tst:=tend;
+		tend:=temp;
+	EndIf
+	readsize% := ChanData(chan%,readarray[],tst,tend);	
+	If readsize% <1 Then		
+		Message("ERROR!|Read size error reading from %s channel!\nTime: %.6f - %.6f",Chantitle$(chan%),tst,tend);	
+		leaveall();	
+	EndIf		
+	Return (readsize%);
+End
+' ----------------------------------------------------------------------
+Func getthresh%();	' Get information on threshold crossing analysis
+	Var threshty%;		' Type of threshold (0:fixed, 1: % max)
+
+	int% := 1;	' Default to on
+	Repeat
+		DlgCreate("Threshold parameters",0,0,42);
+		DlgReal(1,"Threshold level",-10000,10000,16,1); 
+		DlgList(2,10,"1: Fixed|2: % max",2,30,1);
+		DlgCheck(3,"Incluse summing between thresholds?",1,3);
+		er% := DlgShow(thresh,threshty%,int%);
+		If er% = 0 Then 
+			leaveall();
+		EndIf
+		If thresh>100 And threshty%=1 Then
+			Message("Error!|Threshold cannot exceed 100%%");
+			er% :=0;
+		EndIf
+	Until er%<> 0;
+	Return(threshty%);
+End
+
+' ----------------------------------------------------------------------
+Func getsegsums%();	' Get variables to be returned from segments of crank cycle
+	Var csums%;		' Variables to be return
+
+	DlgCreate("Crank cycle variables",0,0,35);
+	DlgList(1,"Return","1: Mean|2: Sum|3: RMS",3,12,1);
+	er% := DlgShow(csums%);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	Return (csums%);
+End
+
+' ----------------------------------------------------------------------
+Func makeres%(); 'Create text file to write to
+	Var rh%;				' Handle for text file window
+	Var temp%[32];		' Array for any exisitng text files open
+	Var k%:=0;			' Looping variable
+
+	Repeat 
+		rh% := FileOpen("Comma seperated values (*.csv)|*.csv||",8,1,"File to save data to");
+		If rh% <0 then
+			er% := Query("Warning!|Error in opening export file!\n\nRetry?");
+			If er% = 0 Then
+				leaveall();
+			EndIf
+		EndIf
+	Until rh% >=0;	
+	Print("%s\n",View(v1%).WindowTitle$());
+	View(v1%);		' Reset time view as active window
+	Return (rh%);
+End
+
+' ----------------------------------------------------------------------
+Func closeres%(rh%,q%); 'Close text file (view to close, whether to query (-1:no)
+
+	er% := View(rh%).FileClose(0,q%);
+	If er% > 0 Then
+		Message("Error!|Could not close new text file");
+	EndIf
+End
+
+' ----------------------------------------------------------------------
+Func dosums(ch%,t1,t2,vars%); ' reads in data between times and returns mean, sum or RMS depending on value of vars%
+	'(Channel to use, start and end times, type of measurement to use (see chanmeasure))
+	Var er%;				' Used for error codes
+	Var val;				' Value returned (mean/integral)
+
+	val:= ChanMeasure(ch%,vars%,t1,t2,er%);
+	If er% = 0 Then
+		Message("Error!|ChanMeasure failed to return value between %.2f and %.2f",t1,t2);
+		leaveall();
+	EndIf
+	Return(val);
+End
+
+' ----------------------------------------------------------------------
+Proc writechhead(rh%,ch%,at%,th);	' Create header for channel in text file (text file handle, channel to create header for, 
+'	type of analysis, threshold)
+	Var chan$;					' Name of channel being processed (used in toolbar text)
+
+	chan$ := ChanTitle$(ch%);
+	ToolBarText("Processing "+chan$+" channel");
+	View(rh%);
+	Print("\nChannel %d: %s",ch%,View(v1%).ChanTitle$(ch%));
+	If at% = 1 Or at% = 3 Then	Print(",,,Threhsold,%.3f",th);	EndIf
+	Print("\nStart t,End t,Trunc,");
+	DoCase
+ 	Case at% = 0 Then	' If doing by crank segment
+		For i% := 0 to 360- segments% step segments% Do
+			Print("%d to %d,,",i%,i%+segments%);
+		Next
+		Print("\n,,");
+		For i% := 0 to 360- segments% step segments% Do
+			Print(",mean,SD");
+		Next
+	Case at% = 1 Then	' If doing by thresholds
+		Print("Rising to falling,,Falling to rising\n,,");	
+		For i% := 0 to 1 Do	
+			Print(",mean,SD");
+		Next
+	Case at% = 2 Then	' If doing by peaks
+		Print("peak,,Angle of peak\n,,");	
+		For i% := 0 to 1 Do	
+			Print(",mean,SD");
+		Next
+	Case at% = 3 Then ' Threshold crossing angles
+		Print("Start angle,,End angle\n,,");	
+		For i% := 0 to 1 Do	
+			Print(",mean,SD");
+		Next
+	Else
+		Message("Error!|Incorrect analysis type passed (%d)",at%);
+		leaveall();
+ 	EndCase
+	Print("\n");
+	View(v1%)
+End
+
+
+' ----------------------------------------------------------------------
+Func findmaxt();	' Find maximum threshold crossing time
+	Var maxt;		' Highest threshold crossing time
+
+	For j% := 0 to 35 Do	' Find first and last threshold crossings
+		If thresht[j%][max(thresht[j%][])] > maxt Then	
+			maxt := thresht[j%][max(thresht[j%][])];
+ 	   EndIf
+  	Next
+	Return(maxt);
+End
+
+' ----------------------------------------------------------------------
+Proc writedata(minsgs%,maxsgs%,rh%,smean[][],sn%[],ang%,at%,t,ch%);	'Write means and SDs to file (minimum and maximum of segments 
+	' in data, text file handle to write to, segment meand and segment n's, if doing angles (1: yes), (start time of read, channel)
+	' only used for error messages)
+	Var winmean[360];			' Array for segment means for time window
+	Var winsd[360];			' Array for segment SDs for time window
+	Var ind%;					' Index of array
+	Var k%;						' Looping variables
+	Var minor := 0.3;			' Coefficient for accepting peaks as small
+	Var pi;
+	Var x[maxthresh%];
+	Var y[maxthresh%];
+	Var meanx,meany;
+			
+	pi := 4.0*ATan(1.0);
+	For i% := minsgs% to maxsgs%-1 Do	' Do for each segment
+		If at% = 1 Then
+			For k% := 1 to sn%[i%] Do		' Handling for small areas of threshold crossing
+				If smean[i%][k%] <= smean[i%][k%]-1 * minor Then
+					smean[i%][k%-1] += smean[i%][k%];
+					ArrConst(smean[i%][k%-1:],smean[i%][k%:]);
+					sn%[i%] -= 1;
+				EndIf
+			Next
+		EndIf
+		If sn%[i%]> 1 Then	' Only do if more than one segment found (should always be the case (or falls over if segn%[i%] = 1))
+			If ang% = 1 Then	' Handling of angles to allow zero crossing (circular stats)
+				ArrConst(x[],smean[i%][0:sn%[i%]-1]);
+				ArrConst(y[],smean[i%][0:sn%[i%]-1]);
+				ArrDiv(x[0:sn%[i%]-1],360/(2*pi));				' Convert to radians
+				ArrDiv(y[0:sn%[i%]-1],360/(2*pi));				' Convert to radians
+				Cos(x[0:sn%[i%]-1]);									' x= cos x
+				Sin(y[0:sn%[i%]-1]);									' y= sin y
+				ArrSum(x[0:sn%[i%]-1],meanx);						' mean x= sum(cos x)/n
+				ArrSum(y[0:sn%[i%]-1],meany);						' mean y= sum(cos y)/n
+				If meanx >0 Then 
+					winmean[i%] := atan(meany/meanx);			' mean angle= atan(meany/meanx)
+				Else
+					winmean[i%] := pi + atan(meany/meanx);		' if mean x<0 then mean angle += 180 degrees
+				EndIf
+				winmean[i%] *=360/(2*pi);							' Convert back to degrees	<<<<
+				winmean[i%] := (winmean[i%] + 360) mod 360;
+				winsd[i%] := (pow(meanx,2) + pow(meany,2));	' r= (xmean^2+ymean^2)^0.5
+				winsd[i%] := 2*(1-winsd[i%]);						' SD= 2(1-r)
+				winsd[i%] *=360/(2*pi);								' Convert back to degrees	<<<<
+				If winsd[i%] > 0 Then	' Will be unless sum of meanx and meany is 1
+					winsd[i%]:= Pow(winsd[i%],0.5);				' SD= (1(1-r))^0.5
+				Else
+					winsd[i%]:= 0;
+					Printlog("Could not calculate SD at time %.3f s in channel %d: sum mean x and mean y = 1\n",t,ch%); ' #### Temp
+				EndIf
+			Else
+				ArrSum(smean[i%][0:sn%[i%]-1],winmean[i%],winsd[i%]);	
+			EndIf
+		Else	
+			PrintLog("Could not calculate mean or SD at time %.3f in channel %d in segment %d (%d segments)\n",t,ch%,i%,sn%[i%]);
+			winmean[i%] := 0;
+			winsd[i%] := 0;	
+		EndIf
+		View(rh%).Print("%#.4f,%#.4f,",winmean[i%],winsd[i%]);	
+	Next
+End
+
+' ----------------------------------------------------------------------
+Proc results(ch%,winsize%,stt,v%,rh%,maxt,at%);	'Calculate values and send to text file 
+	' (Channel to process, size of time windows, start time,type of variable to return, handle 
+	'	of text file, highest threshold crossing time)
+	Var mean;						' Mean of values read
+	Var k%,l%;						' Looping variables 
+	Var firstang%,firstt;		' Angle and time of first threshold crossing
+	Var t1, t2;						' Start and end times of segment windows
+	Var edgew;						' Time of next window edge
+	Var winend,	endflag$;		' Last time in window and character flag for end of file (only used in window size text output to file)
+	Var writeang%;					' Segment angle to assign segment means to
+	Var ind%;						' Index of threshold times (segments of crank cycle/ which thresholds between) 
+	Var minsegs%, maxsegs%;		' Maximum number of possible segments (360/segments-1 if crank cycle) and minimum segment value to use (don't include crank 0 if doing thresholds)
+	Var segmean[36][50000];		' Array for each mean read for each segment 
+	Var segn%[36];					' Number of values returned
+	Var vp%;							' Analysis type to pass to dosums (mean (2), sum (4) or RMS (11))
+	Var done% := 0;				' Flag if found lower time
+
+	DoCase
+		Case at% = 0 Then	' Analysis by crank segments
+			maxsegs% := 360/segments%-1;
+			minsegs% := 0;
+		Case at% = 1 Then	' Analysis by thresholds
+			maxsegs% := 2;
+			minsegs% := 1;
+		Case at% = 2 Then	' Analysis of peaks
+			maxsegs% := 1;	
+			minsegs% := 0;	
+	EndCase
+	If at% = 0 Then
+		firstang% := Min(thresht[minsegs%:360/segments%][0]);
+	Else 
+		firstang% := minsegs% + Min(thresht[minsegs%:(segments%-minsegs%)][0]);
+	EndIf
+	firstt := thresht[firstang%][0];
+	l% := 0; 	' Initialise index of threshold crossing times array
+	edgew:=stt; 	' Initialise window edge
+	ind% := firstang%;	' Reset angle to that of first threshold crossing
+	t1 := firstt;	'Initialise t1
+	t2 := 0; ' Initialise t2
+	View(rh%);
+	Repeat 																						'<<<<<<<<  Do for each time window
+		ArrConst(segn%[],0);	' Reset segment count
+		edgew += winsize%; ' Increment by size of time windows
+		If edgew > maxt then
+			winend := maxt;
+			endflag$ := "*";
+		Else
+			winend := edgew;
+			endflag$ := "";
+		EndIf
+		View(rh%).Print("%.2f,%.2f,%s,",edgew-winsize%,winend,endflag$);
+		View(v1%);
+		Repeat	' 					' <<<<<<<<< Do for all segments in time window
+			ind%+= 1;
+			If ind% > maxsegs% Then ind%:= minsegs%;	EndIf
+			While done% =0 And l% > 0 Do	' Find lower time in next segment 
+				l% -= 1;
+				If thresht[ind%][l%] < t1 And thresht[ind%][l%] > 0 Then 
+					done% := 1;
+				Else			
+				EndIf
+			Wend
+			done% := 0;
+			Repeat	' Find next highest time
+				If l% >= maxthresh% Then
+					Message("ERROR!|Reached end of threshold crossing array\nwith next time not found\n\nThreshold index %d",ind%);
+					leaveall();
+				EndIf
+				t2 := thresht[ind%][l%];
+				l%+=1;
+			Until t2 >= t1+View(v1%).BinSize(ch%)*4 Or t2 <0;
+			l% -= 1; 
+			If t2 > 0 Then		' If haven't reach last threshold crossing
+				DoCase
+					Case v% = 0 Then	' Mean
+						vp% := 2;
+					Case v% = 1 Then	' Sum
+						vp% := 4;
+					Case v% = 2 Then	' RMS
+						vp% := 11;
+				Else
+					Message("Error!|Incorrect analysis type passed (%d)",v%);
+					leaveall();
+				EndCase
+				mean := dosums(ch%,t1,t2,vp%);
+				writeang%:=ind%-1;	' Write to previous segment or shifts data by one segment
+				If writeang%<minsegs% Then writeang%:= maxsegs%;	EndIf
+ 				segmean[writeang%][segn%[writeang%]]:= mean;
+				segn%[writeang%] += 1;
+				t1 := t2; 
+			EndIf
+		Until t2 >= edgew Or t2>=maxt Or t2 < 0 ; ' >>>>>>>>> End of time window
+		writedata(minsegs%,maxsegs%+1,rh%,segmean[][],segn%[],0,at%,t2-timew%,ch%);	'#### Should maxsegs% be +1 wasn't n-1 in writedata (counting from 0 so should be)
+		View(rh%).Print("\n");
+	Until edgew >= maxt;	'											'>>>>> End of channel
+End
+
+
+' ----------------------------------------------------------------------
+Proc dopeak(rh%,evn%[],crch%,ch%,stt,maxt,tw%,pkcoeff);	'Get the positions and magnitude of peaks and write these to file 
+' (text file handle to write to, array holding number of events (crank, rising, falling), crank channel, active channel, peak coefficient)
+
+	Var ct1, ct2;					' Crank zero crossing times 
+	Var ta[2][50000];				' Array for threshold crossing crank angles
+	Var tan%[2];					' Array for count of threshold crossings
+	Var ent;							' End time of window
+	Var k%:=0;						' Looping variable
+	Var endflag$;					' Characher flag if end of window truncated
+	Var peakt;						' Time of peak
+
+	View(rh%).Print("\n");
+	writechhead(rh%,ch%,2,0);
+	Repeat
+		ent := stt+ timew%;
+		If ent > maxt then
+			ent := maxt;
+			endflag$ := "*";
+		Else
+			endflag$ := "";
+		EndIf
+		View(rh%).Print("%.2f,%.2f,%s,",stt,ent,endflag$);
+		ArrConst(tan%[],0);	' Initialise threshold counts to zero
+		Repeat
+			ct1:=thresht[0][k%];
+			ct2:=thresht[0][k%+1];
+			If ct2-ct1 > 0.4 And ct2-ct1 < 1.2 Then	' If CV between 50 and 150 rpm
+				ta[0][tan%[0]]:= ChanMeasure(ch%,14,ct1,ct2,er%);	' Find peak value in crank cycle
+				If er% = 0 Then 
+					Message("Error!|Error finding peak \nbetween %.3f and %.3f seconds",ct1,ct2);
+					leaveall();
+				EndIf
+				peakt :=	setevent(ta[0][tan%[0]]*pkcoeff,ct1,ct2,ch%,0,0,-1,0);	' Find time of peaks (index= -1 so will fall over if called (it shouldn't be!))
+				If peakt > 0 Then	' Will be unless bad data in crank cycle
+					ta[1][tan%[1]] := ChanValue(crch%,peakt);	
+					tan%[1] +=1;
+					tan%[0] +=1;
+				EndIf
+			EndIf
+			k% +=1;
+		Until thresht[0][k%+2] > ent Or thresht[0][k%+2] <0; ' 						' >>>>>>>>> End of time window
+		writedata(0,1,rh%,ta[][],tan%[],0,2,stt,ch%);	' Do without zero crossing handling for peaks
+		ArrConst(ta[0][],ta[1][]);
+		tan%[0] := tan%[1];
+		writedata(0,1,rh%,ta[][],tan%[],1,2,stt,ch%);	' and with for angles
+		View(rh%).Print("\n");
+		stt := ent;
+	Until ent > maxt Or thresht[0][k%+2] <0;
+End
+
+' ----------------------------------------------------------------------
+Proc dothreshpos(rh%,evn%[],crch%,ch%,stt,maxt,tw%);	'Get the positions of threshold crossings and write these to file 
+' (text file handle to write to, array holding number of events (crank, rising, falling), crank channel, active channel)
+
+	Var peakcoeff :=1;			' Coefficient of peak value that must cross in finding peak
+	Var peak;						' Threshold peak must fall below to count as peak
+	Var peakt;						' Timing of peak
+	Var ct1, ct2;					' Crank zero crossing times 
+	Var ta[2][50000];				' Array for threshold crossing crank angles
+	Var tan%[2];					' Array for count of threshold crossings
+	Var ent;							' End time of window
+	Var k%:=0,l%;					' Looping variables
+	Var endflag$;					' Characher flag if end of window truncated
+	Var try% := 0;					' Number of attempts at finding peak
+	Var tryback% := 0;			' Flag if tried going back half a crank cycle to find peak
+
+	While thresht[0][k%] < stt Do	' Find first crank cycle in time window
+		k% += 1;
+		If thresht[0][k%] < 0 Then
+			Message("Error!|Failed to find first crank cycle in time window\nStart time: %.3f",stt);
+			leaveall();
+		EndIf
+	Wend
+'	View(rh%).Print("\n");
+	writechhead(rh%,ch%,3,0);
+	Repeat
+		ent := stt+ timew%;
+		If ent > maxt then
+			ent := maxt;
+			endflag$ := "*";
+		Else
+			endflag$ := "";
+		EndIf
+		View(rh%).Print("%.2f,%.2f,%s,",stt,ent,endflag$);
+		ArrConst(tan%[],0);	' Initialise threshold counts to zero
+		Repeat
+			ct1:=thresht[0][k%];
+			ct2:=thresht[0][k%+1];
+			If er% = 0 Then 
+				Message("Error!|Error finding peak \nbetween %.3f and %.3f seconds",ct1,ct2);
+				leaveall();
+			EndIf
+			If ct2-ct1 > 0.4 And ct2-ct1 < 1.2 Then	' If CV between 50 and 150 rpm
+				Repeat
+					Repeat
+						peak:= ChanMeasure(ch%,14,ct1,ct2,er%)*peakcoeff;	' Find peak value in crank cycle
+						peakt :=	setevent(peak,ct1,ct2,ch%,0,0,-1,0);	' Find time of peaks (index= -1 so will fall over if called (it shouldn't be!))
+						peakcoeff *= 0.9;	' reduce by 10% and try again
+						try% +=1;
+					Until peakt >0 Or try% >3;	' Try five times
+					try% := 0;
+					peakcoeff := 1;
+					If peakt <1 Then	' Still haven't found peak
+						If k% > 0 Then 
+							ct1 := thresht[0][k%-1] + (thresht[0][k%]-thresht[0][k%-1])/2;
+						EndIf
+						If k% < maxthresh% -2 Then 
+							ct2 := thresht[0][k%] + (thresht[0][k%+1]-thresht[0][k%])/2;
+						EndIf
+						tryback% += 1;
+					EndIf
+				Until tryback% > 1 Or peakt >0;
+				tryback% := 0;
+				If peakt = 0 Then
+					PrintLog("Data skipped between %.3f and %.3fs in channel %d: Failed to find peak (%.3f)(%.3f)\n",ct1,ct2,ch%,peak,peakcoeff);
+				EndIf
+				If peakt <0 Then
+					PrintLog("Data skipped between %.3f and %.3fs in channel %d: Found %d peaks (%.3f)(%.3f)\n",ct1,ct2,ch%,peakt*-1,peak,peakcoeff);
+				EndIf
+				If peakt >0 Then	' Will be -1 if bad data in crank cycle
+					j% := evn%[1];
+					While j% >0 Do ' Find high going threshold prior to peak
+						j% -= 1;
+						If thresht[1][j%] <= peakt Then
+							ta[0][tan%[0]] := ChanValue(crch%,thresht[1][j%]);	
+							tan%[0]+=1;
+							j% := 0;
+						EndIf
+					Wend
+					Repeat ' Find low going threshold after peak 1 or 2
+						If thresht[2][j%] >= peakt2 Then
+							ta[1][tan%[1]] := ChanValue(crch%,thresht[2][j%]);	
+							tan%[1]+=1;
+							j% := evn%[2];
+						Else
+							j% += 1;
+						EndIf
+					Until j% =evn%[2];	
+				EndIf
+			EndIf
+			k% +=1;
+		Until thresht[0][k%+2] > ent Or thresht[0][k%+2] <0; ' 						' >>>>>>>>> End of time window
+		writedata(0,2,rh%,ta[][],tan%[],1,2,ct1,ch%);
+		View(rh%).Print("\n");
+		stt := ent;
+	Until ent > maxt Or thresht[0][k%+2] <0;
+End
+
+' ----------------------------------------------------------------------
+Proc getpercthresh(ch%[],thresh);	'Get peak values in channels and calculate % max (array of channels, % threshold)
+	Const wins% := 20;		' Number of windows to split file into
+	
+	Var k%,l%;					' Looping variables
+	Var ch$[32];				' Array for channel titles
+	Var threshwin[wins%];	' Array of max values found in each time window
+	Var stt,ent;				' Start and end times of time windows
+	Var fv%;						' Front view when called
+
+	ChanHide(-1);
+	Xrange(0,MaxTime());
+	fv% := FrontView();
+	FrontView(v1%);
+	For k% := 0 To len(ch%[])-1 Do
+		ChanShow(ch%[k%]);
+		Optimise(ch%[k%]);
+		stt := 0;
+		l% := 0;
+		Repeat 
+			ent := stt + MaxTime(ch%[k%])/wins%;
+			threshwin[l%] := ChanMeasure(ch%[k%],8,stt,ent,er%);
+			If er% = 0 Then
+				Message("Failed to find max in channel %d",ch%[k%]);
+				leaveall();
+			EndIf
+			stt := ent;
+			l% += 1;
+		until ent >= MaxTime(ch%[k%]) Or l% >= wins%-1;
+		ArrSum(threshwin[],chthresh[k%]);
+		ch$[k%] := ChanTitle$(ch%[k%]);
+	Next
+	ArrMul(chthresh[],thresh/100);
+	DlgCreate("Channel max's",0,0,42);
+	For k% := 1 To len(ch%[]) Do
+		DlgReal(k%,ch$[k%-1],YLow(ch%[k%-1]),YHigh(ch%[k%-1]),15,k%);
+	Next
+	er% := DlgShow(chthresh[]);
+	If er% = 0 Then 
+		leaveall();
+	EndIf
+	FrontView(fv%);
+	View(v1%);
+
+End
+
+'===================================================================
+' Main routine
+'===================================================================
+
+Proc main()
+	Var currentch%;				' Channel number currently processing
+	Var timelist%[20];			' Array for list of time views (assumes no more than 20)
+	Var toolbar$;					' String for messages for toolbar
+	Var numchan%;					' Number of channels in file 
+	Var level%;						' Level to find crossing at
+	Var numevent%[3];				' Number of events found in channel at each threshold crossing (crank zeros, rising, falling)
+	Var analtype%;					' Type of analysis to be conducted (0: split by crank segments, 1: thresholds of whole crank cycles)
+	Var analtext$;					' String to hold detials of analysis type for logging
+	Var evmode%;					' Type of events to find (0: peak, 2: rising, 3: falling)
+	Var czero%;						' Flag if looking for crank zero crossing (1)
+	Var sums%;						' Get calculation options for crank segments analysis
+	Var resh%;						' Handle of text file for results 
+	Var maxt:=0;					' Time of last threshold crossing
+	Var ch%;							' Index of channel being processed in wavlist
+	Var peakcoeff;					' Percentage of peak that threshold will be detected at
+	Var threshty%;					' Type of thrshold (0: fixed, 1: % max)
+
+	ToolbarText("Running script version " + ver$);
+	Viewlist (timelist%[], 1);	' Are there any time views already open
+	FrontView(LogHandle());
+	If timelist%[0] > 0 Then  'There are some time views
+		choosev(timelist%[]);
+	Else
+		getfile();		' No time views open go and get one
+	EndIf
+	View(v1%);	' Set returned view as active 
+	PrintLog("\n\n=====>> FP_extract v%s <<=================================>>> %s <<<====================================\n\n",ver$,Windowtitle$());
+	Repeat 
+		wavlist%[0]:=getca%();
+		numchan% :=	getch%(wavlist%[0]);
+		If numchan% <1 Then
+			Message("Error!|No channels selected!");
+		EndIf
+	until numchan% > 0;
+	analtype% := gettype%();
+	gettimes(60,0,Maxtime());	' (Default time window,start and end values)
+	resh% := makeres%();
+	PrintLog("\nFile split into %d second windows from %.4f to %.4f (%d windows)\n\n",timew%,startt,endt,Round(((endt-startt)/timew%)+0.49999));	
+	View(resh%).Print("%d,Time windows\n",Round(((endt-startt)/timew%)+0.49999));
+	maxt:= findmaxt();
+	For i% := 0 to 35 Do		' Initialise threshold crossing times array
+		ArrConst(thresht[i%][],-1);
+	Next
+	DoCase
+		Case analtype% = 0 Then	' >>>>>>>>>>>>>>>>> Analysis by segments of crank cycle
+			segments% := getsegs%(10);	' (Default segment size)
+			PrintLog("\nAnalysis by segments of crank cycle\n\nFile split into %d degree crank segments\n",segments%);
+			sums% := getsegsums%();
+			DoCase
+				Case sums% = 0 Then analtext$ :="mean";	
+				Case sums% = 1 Then analtext$ :="sum";	
+				Case sums% = 2 Then analtext$ :="RMS";	
+			EndCase
+			View(resh%).Print("Analysis by segments of crank cycle\nExtracting %s\n",analtext$);
+			ToolbarText("Splitting data into segments of crank cycle");
+			For i% := 0 to 360-segments% Step segments% Do
+				If i% = 0 Then 
+					evmode% := 3;
+					czero% := 1;
+				Else
+					evmode% :=2;
+					czero% := 0;
+				EndIf
+				numevent%[0] := setevent(i%,startt,endt,wavlist%[0],evmode%,czero%,i%/segments%,1);	
+			Next
+			maxt:= findmaxt();
+			For ch% := 1 to numchan%-1 Do	' Do for all channels
+				writechhead(resh%,wavlist%[ch%],analtype%,0);
+				results(wavlist%[ch%],timew%,startt,sums%,resh%,maxt,analtype%);	' Send data to text file
+			Next
+		Case analtype% = 1 Then	' >>>>>>>>>>>>>>>>> Anaysis by threshold crossing in source channel
+			segments% := 3;	
+			threshty% := getthresh%();
+			If threshty% = 0 Then	
+				analtext$ :="fixed";	
+				ArrConst(chthresh[],thresh);
+			Else 
+				analtext$ :="% mean";	
+				getpercthresh(wavlist%[1:numchan%-1],thresh);
+			EndIf
+			PrintLog("\nAnalysis by threshold crossings\n\tThreshold: %.3f (%s)\n\tInclude sum between thresholds: %d\t(0: no, 1:yes)\n",thresh,analtext$,int%);
+			View(resh%).Print("Analysis of threshold crossings\nThreshold at %.3f (%s)\n",thresh,analtext$);	
+			ToolbarText("Splitting data into segments of crank cycle");
+			numevent%[0] := setevent(0,startt,endt,wavlist%[0],i%,1,0,1);	'Get crank zero crossings
+			For ch% := 1 to numchan%-1 Do	' Do for all channels
+				maxt:= findmaxt();
+				PrintLog("Channel %d: %s: Threshold %.3f\n",wavlist%[ch%],ChanTitle$(wavlist%[ch%]),chthresh[ch%-1]);
+				For i% := 2 to 3 Do	' Find low going then high going threshold crossings
+					numevent%[i%-1]:= setevent(chthresh[ch%-1],startt,endt,wavlist%[ch%],i%,0,i%-1,1);	'Get thresholdcrossings
+				Next
+				'#### Add routine here to sort thresht's for double peaks!
+				If int% = 1 Then
+					writechhead(resh%,wavlist%[ch%],analtype%,chthresh[ch%-1]);
+					results(wavlist%[ch%],timew%,startt,1,resh%,maxt,analtype%);	' Send data to a text file	<><><><>
+				EndIf
+				dothreshpos(resh%,numevent%[],wavlist%[0],wavlist%[ch%],startt,endt,timew%); ' Write threshold crossing positions too
+			Next
+		Case analtype% = 2 Then	' >>>>>>>>>>>>>>>>> Anaysis of peaks
+			segments% := 1;
+			peakcoeff := getpeakcoeff(75);
+			PrintLog("\nAnalysis of peaks\n\tPeak coefficient at : %.3f\n",peakcoeff);
+			View(resh%).Print("Analysis of peaks\nPeak coefficient %.3f\n",peakcoeff);	
+			ToolbarText("Splitting data into segments of crank cycle");
+			numevent%[0] := setevent(0,startt,endt,wavlist%[0],i%,1,0,1);	'Get crank zero crossings
+			For ch% := 1 to numchan%-1 Do	' Do for all channels
+				dopeak(resh%,numevent%[],wavlist%[0],wavlist%[ch%],startt,endt,timew%,peakcoeff/100);
+			Next
+		Else
+		Message("Error!|How the hell did you get here?");
+		leaveall();
+	EndCase
+	ToolBarText("Dividing data into time windows");	' >>>> This needs moved!
+	ToolBarText("");
+	PrintLog("\nResults written to: %s\n",View(resh%).FileName$(0));
+	closeres%(resh%,-1);
+	leaveall();
+	main();
+End
+
+main();	' Gets the thing going!!!

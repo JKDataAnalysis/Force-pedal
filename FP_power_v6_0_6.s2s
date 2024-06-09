@@ -1,0 +1,406 @@
+'= JK 06/04/04 =====================================================
+' Take processed data from force pedals and calculate;
+' Feff, Fineff, crank vel, power, IIE, Work and Impulse
+'
+' Version info
+' -----------------
+'
+' 1.0
+' 2.0
+' 3.0
+' 3.1
+' 3.2
+' 3.3
+' 3.4 Implemented array arrithmetic in dosums, crankvel and rad
+' 4.1 Calculation of work and impulse added
+' 4.1.2 #### Calculation of Fr added (not complete)
+' 5.0.0 Routines added to also calculate power based on crank velocity being assumed constant
+' 6.0.1 Start of complete rewrite to make use of virtual channels and to adapt for doing linearly interpolated and measured crank angle
+' 6.0.2 As far as modifying getch dialogue
+' 6.0.3 Option for linear crank angle added to getch dialogue
+' 6.0.4 Analysis options dialogue implemented
+' 6.0.5 Tidying up of some of the dialogues
+' (6.0.6 CV calculation implemented)
+'
+' Still to be done!
+' -----------------
+'
+' Calculation of crank velocity is leaving a mess around zero crossings (nearly 0 - nearly 360 does not = nearly 360)
+'
+' Look at using ArrFilt rather than ArrDiff to differntiate CA in CV calculation
+'
+' Error handing required
+' ----------------------
+'
+' There is no error trapping of the channels selected in getch%. Script should check for duplicates or channels with inapproriatte data (e.g. 
+' angle data not 0-360 degrees.
+'
+' Known bugs
+' ----------
+'
+' "Default value" option now works in getch but only as a checkbox and only using a global array, so a working but 
+' messy solution!
+' 
+' In analbtn% the first 100 dialogue items are set, i.e. not the number present. This works, but it's not exactly 
+' good programming!
+'
+'===================================================================
+
+'===================================================================
+' Global consant declarations 
+'===================================================================
+Const arraymax%:= 4000;		            	' Maximum size of array	to read/write blocks of data in	(small is faster)
+Const rads:= 360/(2*3.141592653589793);		' Conversion factor for degrees to rads
+
+'===================================================================
+'Global variable declarations
+'===================================================================
+
+var defch%[32];     ' Default channel list
+'===================================================================
+' Main procedures
+'===================================================================
+
+Func getview%()		' Get a view to use
+	Var timelist%[20];	' Array for list of time views (assumes no more than 20)
+	Var v%;					' Handle of view selected
+
+	Viewlist (timelist%[], 1);	' Are there any time views already open?
+	If timelist%[0] > 0 Then  'There are some time views
+		v%:=choosev(timelist%[]);
+	Else
+		v%:=getfile();		' No time views open go and get one
+	EndIf
+	Return (v%);
+End
+
+' ----------------------------------------------------------------------
+Proc prnthead(h%,ch$,string$);		' Print a header line before (1), after (2), before and after (3), 3+ with additional newline (4) or no header
+    ' (0), character to use, string to include)
+	Const headw%:=70;		' Width of header
+	Var head$;				' Header string
+	Var i%;					' Looping variables
+
+	If h% > 0 then	' create header line
+		For i%:=0 to headw% do
+			head$+=ch$;
+		Next
+		head$+="\n";
+    EndIf
+    If (h%= 1 or h% =3 or h%= 4) then   PrintLog(head$);    endif' Print header
+	PrintLog("%s %s",ch$,string$);  ' Print string
+	For i%:=0 to headw%-(len(string$)+3) do
+		PrintLog(" ");			' Fill with blanks
+	Next
+	PrintLog("%s\n",ch$);
+    If h% >= 2 then 	PrintLog("%s",head$); EndIf ' Print footer
+    If h% = 4 then 	PrintLog("\n"); EndIf       ' add a newline
+End
+
+' ----------------------------------------------------------------------
+Func Choosev(times%[]);	'Choose the time view to be used		(Array of time view handles)
+	Var title$;							' Variable to return view titles to
+	Var timetitle$[20];				' Array for time view titles
+	Var dummy%;							' Variable to return item selected in dialogue to
+	Var er%;								' Error flags
+	Var v%;								' Handle of view selected
+	Var i%;								' Looping variable
+
+	For i% := 1 to times%[0] Do	' Fill an array with time view titles
+		View(times%[i%]);
+		title$ := windowtitle$();
+		timetitle$[i%-1]:= title$;		' (timelist%[0]=No of time views)
+	Next
+	timetitle$[times%[0]] := "- New file -";	'Add new file option to list
+	DlgCreate("Time views already open!",0,0,0,0);
+	DlgText("Select time view",0,1);
+	DlgList(1,35,timetitle$[],(times%[0]+1),18,1);
+	er% := DlgShow(dummy%);	
+	If er% = 1 Then	' user pressed Ok
+		If dummy% = times%[0] Then	' new file selected
+			v%:= getfile();
+		Else
+			v% := times%[dummy%+1]; 'returns selected view (+1 since 0 is No of views)
+		EndIf
+	EndIf
+	Return(v%);
+End
+
+' ----------------------------------------------------------------------
+Func getfile()  ' Open a file
+	Var v%;		' Handle of view opened	
+	v% := FileOpen("",0,1);
+	If v% <= 0 Then
+		Message ("Error!|No file!");
+  	EndIf
+	Return(v%);
+End
+
+' ----------------------------------------------------------------------
+func leaveall()        'quits program 
+	Var er%;					' Error handles
+	er%:=Query("Quit|Quit script?","&Yes","&No");
+	If er% =1 Then
+		halt
+    Else
+        er%:=Query("Start again|Start again?","&Yes","&No");
+        if er%=1 then 
+            main();
+        else
+            return(-1);
+        EndIf
+    endif
+End
+func test%()
+    Message("This doesn't actually do anything yet!\n\n"
+    "The problem is that I can't pass variables to this function, so unless I \n"
+    "use global variables (not keen), I'm not sure how I can do this");
+    return(1);
+end
+Func dfltgetch%(&ch%[],&crankl);   ' Set default values for getch (array to set default handles to, crank length);
+    var i%;             'looping variable
+    Var numchans%;		' Temporary number of channels returned
+    Var wv%[32];		' Dummy array for waveform channels
+
+    numchans% := ChanList(wv%[],8193);
+	For i% := 1 to numchans% Do				' Set channels with matching names as defaults
+        DoCase
+            Case ChanTitle$(wv%[i%]) = "CA_p" Then ch%[0] := wv%[i%];  
+			Case ChanTitle$(wv%[i%]) = "LPA_p" Then ch%[1] := wv%[i%];
+			Case ChanTitle$(wv%[i%]) = "RPA_p" Then ch%[2] := wv%[i%];
+            Case ChanTitle$(wv%[i%]) = "LFx_p" Then ch%[3] := wv%[i%];
+			Case ChanTitle$(wv%[i%]) = "LFy_p" Then ch%[4] := wv%[i%];
+			Case ChanTitle$(wv%[i%]) = "RFx_p" Then ch%[5] := wv%[i%];
+            Case ChanTitle$(wv%[i%]) = "RFy_p" Then ch%[6] := wv%[i%];
+            Case ChanTitle$(wv%[i%]) = "CA_p_L" Then ch%[7] := wv%[i%];
+        EndCase
+    Next
+    ArrConst(defch%[],ch%[]);   ' copy channels to global array
+    crankl := 175;	' Default crank length
+End    
+Func getch%(&crnk,&ch%[],ch$[],linca%,&df%)		' Procedure to identify channels (crank length, channel handles, channel titles)
+    Var er%;		    		' Error codes
+    Var i%;     			    ' Looping variable
+    const col1%:=1;             ' Position for column 1
+    Var col%:=col1%;            ' Starting position for dialogue columns 
+    Var rw%:=2;                 ' Dialogue row
+    const csp%:=43,chos%:=11;   ' Dialogue column spacing, channel offset
+    var lca%;                   ' Flag whether including linear CA
+    
+    DlgCreate("Please identify channels",0,0);	' Display dialogue to allow user to alter if needed
+    DlgCheck(10,"&Linear crank angle",rw%,5);
+    DlgText("Angles",col%+chos%,1);
+    DlgText("Forces",col%+csp%+chos%,1);
+    for i%:= 1 to 8 do
+        if i%= 4 then col%+=csp%; rw%:=2;  endif
+        if i% = 8 then col%:=col1%; endif
+        DlgText(ch$[i%-1],col%,rw%);
+        DlgChan(i%,"",8193,col%+chos%,rw%);
+        rw%+=1;
+    next
+    DlgReal(9,"Crank Length (mm)",150,200,20,9,2.5,4);
+    DlgCheck(11,"use &defaults",50,9);
+    DlgAllow(0x3ff, 0, getchchng%);
+    if df%=1 then dfltgetch%(ch%[],crnk);  endif
+    er% := DlgShow(ch%[],crnk,linca%,df%);
+    If er% = 0 Then	
+        Return(-1);	
+    else
+        Return(linca%); ' whether linear CA active
+    endif
+End
+func getchchng%(x%);    ' getch dialogue change
+    var v%;
+    var i%;
+    docase
+    case ((x% = 10) or (x% = 0)) then '0 is initial setup
+        v% := DlgValue(10);        'get checkbox state
+        DlgEnable(v%, 8); 
+    case (x% = 11) then ' use defaults
+        if DlgValue(11)=1 then 
+            for i%:=0 to 6 do
+                DlgValue(i%+1,defch%[i%]);
+            next
+        endif
+    endcase;
+    return 1;                     'Return 1 to keep dialog running
+end;
+Func checkview(v%,minch%);  ' Check passed view is appropriatte (view handle, minimum number of channels)
+    Var ch%[1];     ' Array to hold list of channels (nominal length)
+    Var chn%;       ' Number of channels
+
+    If Viewkind(v%)=0 then ' time view passed
+        chn%:= ChanList(ch%,1+16384);
+        if chn%>=minch% then ' all good
+            return (v%)
+        else
+            Message("Insufficient channels errror|Not enough waveform channels available in chosen file\n\nA minimum of %d is required only %d exist in the chosen file",minch%,chn%);
+            return (-2);
+        endif
+    else
+        Message("View type errror|Incorrect view type passed (%d). View must be a time view",ViewKind(v%));
+        return (-1);
+    endif
+End
+func getanalopt%(&opt%[],optttl$[]); ' Choose analysis options (options selected, titles of options)
+    Var er%,btn%;       ' Error codes, button value
+    Var i%;     		' Looping variable
+    var col%:=1;        ' Column position
+    Var rw%:=1;         ' Dialogue row (column 1)
+    var maxrw%;         ' Maximum number of rows in each column
+    const csp%:=35;     ' Dialogue column spacing
+    var n%;             ' number of options passed
+
+    n% := len(opt%[]);
+    maxrw% := floor((n%+1)/(floor(n%/9)+2));
+
+    DlgCreate("Choose analysis options",0,0);	
+    for i%:= 1 to n% do 
+        if rw% > maxrw% then col%+=csp%; rw%:=1; endif
+        DlgCheck(i%,optttl$[i%-1],col%,rw%);
+        rw%+=1;
+    next
+    DlgButton(3,"&All o&n",analbtn%,1,maxrw%+2);
+    DlgButton(2,"&All o&ff",analbtn%,12,maxrw%+2);
+Return(DlgShow(opt%[]));
+end 
+func analbtn%();
+    var i%;     ' Looping variable
+
+    for i%:=1 to 100 do
+        DlgValue(i%,DlgButton()-2);
+    next    
+    return 1;
+end 
+Func createwav(ch%,ch$,unit$)	' Create wav channel (Channel to use as template, title, units for new channel)
+    var memch%;             ' handle of memory channel created
+	Const scalef := 6553.6;		' Channel scaling factor (see help)
+
+	memch% := MemChan(1,0,binsize(ch%),0,ch%);	' Create waveform channel to write to  
+	If memch% < 1 Then 																	
+		Message("ERROR!|Unable to create memory channel");
+		return(-1);
+	EndIf
+	ChanUnits$(memch%,unit$);															
+	ChanTitle$(memch%,ch$);														
+    ChanScale(memch%,ChanScale(ch%));	
+    'YRange(tempch%[i%*6+loop%],miny%,maxy%);														
+    ChanShow(memch%);
+    Return(memch%);
+End
+Func cv(cach%,cvch%)	' Calculate CV from CA and write to passed memory channel (CA (source) and CV (destination) channels
+    const arrsz%:=80000;    ' size of array 
+    var rarr[arrsz%];       ' Array to read data into
+    var ts:=0,te:=0,tr;     ' Start and end times of read, time that will fit in array
+    var bn%;                ' number of bins read
+
+    tr:= (arrsz%)*binsize(cach%);			' Calculate time window that will fit it the array 
+    seconds(0);    '>>>> TEMP
+    repeat
+        ts:=te;
+        te:=ts+tr;
+        if te>  maxtime(cach%) Then    te := maxtime(cach%);  endif	' Would read from beyond end of file
+        bn% := ChanData(cach%,rarr[],ts,te);	' Read in data
+        If bn% <1 Then		
+            Message("Data read error!|Data read error in channel %d between %.3g and %.3gs",cach%,ts,te);	
+            return(-1);
+        EndIf
+        ArrDiff(rarr[]);    ' Differntiate array (change in angle between bins)
+        ArrAdd(rarr[],180); ' so that zero crossings (diff of around 360/0 will mod to around 0)
+        ArrDiv(rarr[],360); ' }
+        frac(rarr[]);       ' } modulus (x modulus d = abs(frac(x/d)*d))
+        ArrMul(rarr[],360); ' }
+        abs(rarr[]);
+        Arrsub(rarr[],180); ' take the 180 back off again
+        ArrDiv(rarr[],binsize(cvch%)); ' Divide by bins (change in angle/ sec) 
+        bn% := ChanWriteWave(cvch%,rarr[:bn%],ts);	' Write data to CV channel
+        If bn% <1 Then		
+            Message("Data write error!|Data write error in channel %d between %.3g and %.3gs",cvch%,ts,te);	
+            return(-1);
+        EndIf
+	    
+    until te>= maxtime(cach%);    
+    PrintLog("\nTime: %.5f\n",seconds());   '>>>> TEMP
+    Return (1);	
+End
+
+'===================================================================
+' Main routine
+'===================================================================
+
+Proc MAIN()
+	Var v1%;					' Handle of time view to use
+    Var er%;                    ' Error codes
+    Var wavlist%[8];	    	' Array to hold list of channels for processing (in order: crank, L pedal, R pedal, LFx, LFy, Rfx, RFy, lin CA)
+    Var cl;				    	' Crank length (mm)
+    Var chttl$[8];              ' Channel titles
+    Var i%;                     ' Looping variable
+    Var lca%;                   ' Whether linear CA is enabled or not
+    Var scs$;                   ' String for message if succeeded
+    var analopt%[20],optn%;     ' Array for analysis options selected, number of options listed in anal$
+    var anal$[20];              ' Array of names of analysis options
+    var analch%[40];            ' Array for channel handles of analysis channels
+    var def%:=1;                ' Whether to use defaults
+    var nchttl$,nchunit$;       ' Channel title and units for new channels
+    
+    ' ==== Initialisation =======
+    ReadSetup("","","","",",");
+    ReadStr("&Crank,&Left pedal,&Right pedal,Left F&x,Left F&y,Right &Fx,Ri&ght Fy,Crank (&lin)",chttl$[]);
+    optn%:=ReadStr("CV (&read),CV (&linear),&Power (L/R),Power (N&ET),Fr/F&t,&IIE",anal$[]);
+    ArrConst(analopt%[],1); ' Everything selected as default
+    ReadSetup(); ' Restore default read setup
+    repeat  '============ start of main stuff =====================
+        ToolbarText("Running script version " + View(App(3)).WindowTitle$());
+        repeat
+            v1%:=getview%();
+            if v1%>0 then v1%:=checkview(v1%,7); endif
+            If v1%<1 then ' Failed to get view
+                leaveall();	
+            EndIf	
+        until v1%>0;
+            
+        View(v1%);	' Set returned view as active 
+        PrintLog("\n\n");
+        Prnthead(1,"#","Running: "+print$("%s",View(App(3)).WindowTitle$()));
+        Prnthead(4,"#","Time view: "+print$("%s",Windowtitle$()));
+        repeat    
+            lca%:= getch%(cl,wavlist%[],chttl$[],lca%,def%);
+            If lca%<0 then lca%:=leaveall()    endif
+        until lca%>=0;    
+        Prnthead(3,"+",Print$("%-20s%s","Variable","Assigned channel"));
+        For i% := 0 to 6+lca% do    ' Include linear crank channel if active
+            Prnthead(0,"+",Print$("%-20s%s",chttl$[i%],ChanTitle$(wavlist%[i%])));
+        next
+        prnthead(3,"+", Print$("%-20s%s","Crank length",str$(cl,0,-1)+" mm"));
+        repeat
+            er%:=getanalopt%(analopt%[:optn%],anal$[:optn%]);
+            if er%=0 then 
+                er%:=leaveall();   
+            else
+                If arrsum(analopt%[:optn%])<1 then
+                    Message("Selection error|No analysis options selected");
+                    er%:=0;
+                endif
+            endif
+        until er%=1;   
+        if (ArrSum(analopt%[0:4])>0) then  ' CV/power options selected
+            for i%:=0 to lca% do
+                nchunit$:=ChanUnits$(wavlist%[0])+"/s";
+                nchttl$:="CV"; If i% = 1 then nchttl$:="CV_L";  endif
+                analch%[i%] := createwav(wavlist%[0],nchttl$,nchunit$); ' Create channel for crank velocity
+                if analch%[i%] <1 then leaveall();  endif
+                er% := cv(wavlist%[0+i%*7],analch%[i%]);
+                if er% <1 then 
+                    leaveall();  
+                else
+                    Optimise(analch%[i%]);
+                endif
+            next
+        endif
+        FrontView(View(v1%));	
+        scs$:=Print$("%s %s%s","Success!|Processing of",View(v1%).Windowtitle$()," successfully completed\n\nQuit script?");
+        er%:=Query(scs$,"&Yes","&No");	
+     until er%=1;
+End
+
+main();	' Gets the thing going!!!
